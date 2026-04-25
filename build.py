@@ -120,7 +120,11 @@ def fix_meta(font, family_name, weight_name, is_italic, is_wide, avg_width):
     if "Bold" in weight_name: fs_sel |= (1 << 5)
     if is_italic: fs_sel |= (1 << 0)
     if not is_italic and weight_name == "Regular": fs_sel |= (1 << 6)
+    fs_sel |= (1 << 7)
     font['OS/2'].fsSelection = fs_sel
+    
+    if font['OS/2'].version < 4:
+        font['OS/2'].version = 4
 
     mac_style = 0
     if "Bold" in weight_name: mac_style |= (1 << 0)
@@ -174,13 +178,13 @@ def condense_font_x(font, scale_x):
     for h_name, h_data in new_hmtx_data.items():
         hmtx[h_name] = h_data
 
+
 def adjust_font(font, target_font, target_width, target_upm, slant_degree, baseline_char_latin, baseline_char_kr):
     hmtx = font['hmtx']
     glyf = font['glyf']
     cmap = font.getBestCmap()
     glyph_set = font.getGlyphSet()
 
-    # Baseline 정렬용 위치
     t_cmap = target_font.getBestCmap()
     t_glyph_set = target_font.getGlyphSet()
     
@@ -197,7 +201,11 @@ def adjust_font(font, target_font, target_width, target_upm, slant_degree, basel
     s_height = s_ymax - s_ymin
 
     scale_factor = t_height / s_height
-    shift_y = t_ymin - (s_ymin * scale_factor)
+    
+    y_scale = scale_factor * 1.05 
+    
+    shift_y = t_ymin - (s_ymin * y_scale)
+    
     slant_x = math.tan(slant_degree * 3.1416 / 180.0)
 
     new_glyf_data = {}
@@ -221,8 +229,7 @@ def adjust_font(font, target_font, target_width, target_upm, slant_degree, basel
         rec_pen = DecomposingRecordingPen(glyph_set)
         glyph.draw(rec_pen, glyf)
 
-        # (Scale X, Vertical Shear, Horizontal Shear, Scale Y, Translate X, Translate Y)
-        transform_matrix = (scale_factor, 0, slant_x * scale_factor, scale_factor, 0, shift_y)
+        transform_matrix = (scale_factor, 0, slant_x * y_scale, y_scale, 0, shift_y)
         
         pen_step1 = TTGlyphPen(glyph_set)
         t_pen1 = TransformPen(pen_step1, transform_matrix)
@@ -258,6 +265,7 @@ def adjust_font(font, target_font, target_width, target_upm, slant_degree, basel
         hmtx[h_name] = h_data
 
     font['head'].unitsPerEm = target_upm
+    
 
 def enablecjk(font):
     for table_tag in ['GSUB', 'GPOS']:
@@ -339,6 +347,12 @@ def build_variant(latin_font, kr_font, weight_key, is_italic, is_wide, latin_tar
     out_filename = OUTPUT_FILENAME.format_map({"filename": family_name.replace(' ', ''), "style": style})
     print(f"Working: {out_filename}")
 
+    temp_latin_reference = f"temp/temp_latin_reference_{out_filename}"
+    latin_font.save(temp_latin_reference)
+    
+    latin_metrics = copy.deepcopy(latin_font['OS/2'])
+    latin_hhea = copy.deepcopy(latin_font['hhea'])
+
     clean(latin_font)
     clean(kr_font)
     
@@ -348,9 +362,9 @@ def build_variant(latin_font, kr_font, weight_key, is_italic, is_wide, latin_tar
     adjust_font(kr_font, latin_font, kr_target_width, latin_upm, is_italic*slant_degree, 'X', '모')
     filter_kr(kr_font)
     
-    temp_latin_unhinted = f"temp_latin_unhinted_{out_filename}"
-    temp_latin_hinted = f"temp_latin_hinted_{out_filename}"
-    temp_kr = f"temp_kr_{out_filename}"
+    temp_latin_unhinted = f"temp/temp_latin_unhinted_{out_filename}"
+    temp_latin_hinted = f"temp/temp_latin_hinted_{out_filename}"
+    temp_kr = f"temp/temp_kr_{out_filename}"
 
     latin_font.save(temp_latin_unhinted)
     kr_font.save(temp_kr)
@@ -358,10 +372,20 @@ def build_variant(latin_font, kr_font, weight_key, is_italic, is_wide, latin_tar
     ttfautohint(
         in_file=temp_latin_unhinted,
         out_file=temp_latin_hinted,
-        windows_compatibility=True
+        reference_file=temp_latin_reference,
+        windows_compatibility=True,
     )
 
     merged = Merger().merge([temp_latin_hinted, temp_kr])
+
+    merged['OS/2'].sTypoAscender = latin_metrics.sTypoAscender
+    merged['OS/2'].sTypoDescender = latin_metrics.sTypoDescender
+    merged['OS/2'].sTypoLineGap = latin_metrics.sTypoLineGap
+    merged['OS/2'].usWinAscent = latin_metrics.usWinAscent
+    merged['OS/2'].usWinDescent = latin_metrics.usWinDescent
+    merged['hhea'].ascent = latin_hhea.ascent
+    merged['hhea'].descent = latin_hhea.descent
+    merged['hhea'].lineGap = latin_hhea.lineGap
 
     fix_meta(merged, family_name, weight_key, is_italic, is_wide, avg_width=latin_target_width)
     enablecjk(merged)
@@ -386,9 +410,11 @@ def build_variant(latin_font, kr_font, weight_key, is_italic, is_wide, latin_tar
     merged.save(os.path.join(dir_path, out_filename))
     shutil.copyfile(os.path.join(dir_path, out_filename), os.path.join(all_path, out_filename))
 
-    for tmp in [temp_latin_unhinted, temp_latin_hinted, temp_kr]:
+    for tmp in [temp_latin_unhinted, temp_latin_hinted, temp_latin_reference, temp_kr]:
         if os.path.exists(tmp): os.remove(tmp)
 
+
+import traceback
 def _worker_build(task):
     weight = task['weight']
     is_italic = task['is_italic']
@@ -402,26 +428,37 @@ def _worker_build(task):
     latin_font = get_latin_font(weight, is_italic, familyname+modifier)
     kr_font = get_kr_font(weight)
 
-    build_variant(
-        latin_font=latin_font,
-        kr_font=kr_font,
-        weight_key=weight,
-        is_italic=is_italic,
-        is_wide=is_wide,
-        latin_target_width=latin_target_width,
-        kr_target_width=kr_target_width,
-        slant_degree=8.5,
-        family_name=family_name
-    )
+    try:
+        build_variant(
+            latin_font=latin_font,
+            kr_font=kr_font,
+            weight_key=weight,
+            is_italic=is_italic,
+            is_wide=is_wide,
+            latin_target_width=latin_target_width,
+            kr_target_width=kr_target_width,
+            slant_degree=8.5,
+            family_name=family_name
+        )
 
-def merge_all(regular_only=False):
+    except Exception:
+        traceback.print_exc()
+
+        
+
+def merge_all():
     if os.path.exists(OUTPUT_DIR): shutil.rmtree(OUTPUT_DIR)
+    if os.path.exists('./temp'): shutil.rmtree('./temp')
     os.makedirs(OUTPUT_DIR)
+    os.makedirs('./temp')
 
     tasks = []
     styles = ((i,j,k,l) for i in WEIGHT_MAP.keys() for j in [False, True] for k in ['Code', 'Mono'] for l in ['', 'NF', 'PL'])
     
     for (weight,is_italic,familyname,modifier) in styles:
+        # if familyname != 'Code': continue
+        # if modifier != '': continue
+
         tasks.append({
             'weight': weight, 'is_italic': is_italic, 'familyname': familyname, 'modifier': modifier,
             'family_name': f'Casquare {(familyname + " " + modifier).rstrip()} Std',
@@ -431,7 +468,7 @@ def merge_all(regular_only=False):
         tasks.append({
             'weight': weight, 'is_italic': is_italic, 'familyname': familyname, 'modifier': modifier,
             'family_name': f'Casquare {(familyname + " " + modifier).rstrip()} 1080',
-            'is_wide': True, 'latin_target_width': 1080, 'kr_target_width': 2160
+            'is_wide': False, 'latin_target_width': 1080, 'kr_target_width': 2160
         })
         
         tasks.append({
@@ -444,5 +481,5 @@ def merge_all(regular_only=False):
         executor.map(_worker_build, tasks)
         
 if __name__ == "__main__":
-    merge_all(False)
+    merge_all()
     
